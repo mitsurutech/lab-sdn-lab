@@ -1,0 +1,356 @@
+# Networking lab: software-defined networking with Open vSwitch and Mininet
+# A switch, three hosts and an OpenFlow controller are in this one VM.
+# Everything is installed by the setup below, from Ubuntu's archive, the first time it starts.
+cpus: 1
+memory: 1024    # MB
+disk: 10        # GB
+
+# Nothing opens in the browser: the lab is the terminal.
+open: []
+
+# Run once, as root. Its output is kept in /var/log/mitsurutech-setup.log on the VM.
+setup: |
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq openvswitch-switch openvswitch-testcontroller mininet python3-os-ken iproute2 iputils-ping tcpdump
+  mkdir -p /etc/sdnlab /usr/share/sdnlab /usr/local/lib/sdnlab
+  cat > /usr/local/bin/sdnlab <<'SDNLAB_TOOL_END'
+  #!/bin/bash
+  # sdnlab: an Open vSwitch switch (br0) and three hosts (h1, h2, h3) as network namespaces.
+  #   sdnlab status | flows | controller | down | reset
+  # flows loads /etc/sdnlab/flows.txt into the switch with no controller. controller starts
+  # /etc/sdnlab/switch.py as the switch's controller. Either one builds the lab again.
+  [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+  CONF=/etc/sdnlab
+  BR=br0
+  LOG=/var/log/sdnlab-controller.log
+  OF="ovs-ofctl -O OpenFlow13"
+
+  ovs_up() {
+    ovs-vsctl --timeout=2 show >/dev/null 2>&1 && return 0
+    systemctl start openvswitch-switch 2>/dev/null
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      ovs-vsctl --timeout=1 show >/dev/null 2>&1 && return 0
+      sleep 1
+    done
+    echo "sdnlab: Open vSwitch is not running"; exit 1
+  }
+
+  down() {
+    pkill -f /usr/local/lib/sdnlab/ctl.py 2>/dev/null
+    ovs-vsctl --timeout=5 --if-exists del-br $BR 2>/dev/null
+    for n in h1 h2 h3; do
+      ip netns pids $n 2>/dev/null | xargs -r kill 2>/dev/null
+      # Deleting this end removes the pair at once; a deleted namespace takes its end a moment later.
+      ip link del s-$n 2>/dev/null
+      ip netns del $n 2>/dev/null
+    done
+    return 0
+  }
+
+  up() {
+    ovs_up
+    down
+    ovs-vsctl add-br $BR -- set bridge $BR datapath_type=system protocols=OpenFlow13 fail-mode=secure
+    ip link set $BR up
+    for n in 1 2 3; do
+      ip netns add h$n
+      ip -n h$n link set lo up
+      ip netns exec h$n sysctl -qw net.ipv6.conf.all.disable_ipv6=1
+      ip link add s-h$n type veth peer name eth0 netns h$n
+      ip -n h$n link set eth0 address 00:00:00:00:00:0$n
+      ip -n h$n addr add 10.0.0.$n/24 dev eth0
+      ip -n h$n link set eth0 up
+      ip link set s-h$n up
+      ovs-vsctl add-port $BR s-h$n -- set interface s-h$n ofport_request=$n
+    done
+  }
+
+  flows() {
+    up
+    if ! out=$($OF add-flows $BR $CONF/flows.txt 2>&1); then
+      echo "sdnlab: $CONF/flows.txt has a mistake:"; echo "$out"; exit 1
+    fi
+    echo "sdnlab: switch br0 with $($OF dump-flows $BR | grep -c priority) flow(s) from flows.txt, no controller"
+  }
+
+  controller() {
+    up
+    ovs-vsctl set-controller $BR tcp:127.0.0.1:6653
+    setsid python3 /usr/local/lib/sdnlab/ctl.py $CONF/switch.py </dev/null >$LOG 2>&1 &
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      [ "$(ovs-vsctl get controller $BR is_connected)" = true ] && { echo "sdnlab: controller connected, log in $LOG"; return 0; }
+      sleep 1
+    done
+    echo "sdnlab: the controller did not connect. Its log:"; tail -n 15 $LOG; exit 1
+  }
+
+  status() {
+    ovs-vsctl --timeout=2 br-exists $BR 2>/dev/null || { echo "sdnlab: not up (sdnlab flows)"; exit 1; }
+    echo "switch $BR (fail-mode $(ovs-vsctl get-fail-mode $BR), controller: $(ovs-vsctl get-controller $BR | head -1))"
+    $OF show $BR | grep -E '^ [0-9]+\(' | sed 's/^/  port /'
+    echo "hosts"
+    for n in h1 h2 h3; do echo "  $n $(ip -n $n -4 -o addr show dev eth0 | awk '{print $4}') $(ip netns exec $n cat /sys/class/net/eth0/address)"; done
+    echo "flows"
+    $OF dump-flows $BR | grep priority | sed 's/^ cookie=0x0, duration=[0-9.]*s, table=0, /  /'
+  }
+
+  case "$1" in
+    flows) flows ;;
+    controller) controller ;;
+    down) down ;;
+    reset)
+      down
+      cp /usr/share/sdnlab/flows.txt $CONF/flows.txt
+      cp /usr/share/sdnlab/switch.py $CONF/switch.py
+      chown student:student $CONF/flows.txt $CONF/switch.py 2>/dev/null
+      flows ;;
+    status|"") status ;;
+    shell)
+      case "$2" in h1|h2|h3) ;; *) echo "sdnlab: no host $2 (h1, h2 or h3)"; exit 1 ;; esac
+      mkdir -p /run/sdnlab
+      printf "PS1='%s# '\n" "$2" > /run/sdnlab/$2.rc
+      exec ip netns exec $2 bash --rcfile /run/sdnlab/$2.rc -i ;;
+    *) sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  esac
+  SDNLAB_TOOL_END
+  chmod 755 /usr/local/bin/sdnlab
+  cat > /usr/local/lib/sdnlab/ctl.py <<'SDNLAB_CTL_END'
+  #!/usr/bin/python3
+  """Runs one OpenFlow 1.3 controller application with os-ken: ctl.py /path/to/app.py.
+  The Ubuntu packages carry the os-ken library and no command to start an application, so this
+  is that command. It listens for the switch on port 6653."""
+  import sys
+  import eventlet
+  eventlet.monkey_patch()
+  from os_ken import cfg
+  from os_ken.base import app_manager
+  from os_ken.lib import hub
+
+  if len(sys.argv) != 2:
+      sys.exit('usage: ctl.py /path/to/app.py')
+  cfg.CONF(args=['--ofp-tcp-listen-port', '6653'], project='os_ken')
+  manager = app_manager.AppManager.get_instance()
+  manager.load_apps([sys.argv[1]])
+  contexts = manager.create_contexts()
+  hub.joinall(manager.instantiate_apps(**contexts))
+  SDNLAB_CTL_END
+  cat > /usr/share/sdnlab/flows.txt <<'SDNLAB_FLOWS_END'
+  # The switch's flow table, loaded by: sudo sdnlab flows
+  # One flow per line, in the form ovs-ofctl add-flow takes, OpenFlow 1.3, for the switch br0.
+  # Nothing is here yet, so the switch drops every packet. Ports: 1 is h1, 2 is h2, 3 is h3.
+  # Hosts: h1 10.0.0.1 and MAC 00:00:00:00:00:01, h2 ...02, h3 ...03.
+  # Example of the form (this one is not what the lab asks): priority=5,udp,actions=drop
+  SDNLAB_FLOWS_END
+  cat > /usr/share/sdnlab/switch.py <<'SDNLAB_SWITCH_END'
+  """Your learning switch, an OpenFlow 1.3 controller application for os-ken.
+  Start it with: sudo sdnlab controller   Its log is /var/log/sdnlab-controller.log
+  Finish the three TODO steps in packet_in. The rest is given."""
+  from os_ken.base import app_manager
+  from os_ken.controller import ofp_event
+  from os_ken.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
+  from os_ken.lib.packet import ethernet, packet
+  from os_ken.ofproto import ofproto_v1_3
+
+
+  class LearningSwitch(app_manager.OSKenApp):
+      OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+
+      def __init__(self, *args, **kwargs):
+          super().__init__(*args, **kwargs)
+          self.mac_to_port = {}  # switch id -> {MAC address -> port number}
+
+      def add_flow(self, dp, priority, match, actions):
+          """Install one flow on the switch (given)."""
+          parser = dp.ofproto_parser
+          apply_now = parser.OFPInstructionActions(dp.ofproto.OFPIT_APPLY_ACTIONS, actions)
+          dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=priority, match=match,
+                                        instructions=[apply_now]))
+
+      @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+      def switch_connected(self, ev):
+          """A switch has connected: send every packet it has no flow for to this controller (given)."""
+          dp = ev.msg.datapath
+          parser, ofp = dp.ofproto_parser, dp.ofproto
+          to_me = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
+          self.add_flow(dp, 0, parser.OFPMatch(), to_me)
+
+      @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+      def packet_in(self, ev):
+          """The switch had no flow for a packet and sent it here."""
+          msg = ev.msg
+          dp = msg.datapath
+          parser, ofp = dp.ofproto_parser, dp.ofproto
+          in_port = msg.match['in_port']
+          frame = packet.Packet(msg.data).get_protocols(ethernet.ethernet)[0]
+          table = self.mac_to_port.setdefault(dp.id, {})
+
+          # TODO 1: learn. Remember that frame.src is reached through in_port.
+
+          # TODO 2: choose the port. Use the one learned for frame.dst, or ofp.OFPP_FLOOD if
+          # this switch has not seen frame.dst yet.
+          out_port = ofp.OFPP_FLOOD
+
+          actions = [parser.OFPActionOutput(out_port)]
+
+          # TODO 3: install a flow, only when out_port is a real port, so that the next packets
+          # of this conversation never come here. Match in_port, eth_src and eth_dst.
+
+          # Send this first packet on its way (given).
+          dp.send_msg(parser.OFPPacketOut(datapath=dp, buffer_id=ofp.OFP_NO_BUFFER,
+                                          in_port=in_port, actions=actions, data=msg.data))
+  SDNLAB_SWITCH_END
+  cp -n /usr/share/sdnlab/flows.txt /usr/share/sdnlab/switch.py /etc/sdnlab/
+  chown student:student /etc/sdnlab/flows.txt /etc/sdnlab/switch.py 2>/dev/null
+  cat > /etc/systemd/system/sdnlab.service <<'SDNLAB_UNIT_END'
+  [Unit]
+  Description=SDN lab: an Open vSwitch switch and three hosts as namespaces
+  After=network.target openvswitch-switch.service
+  Wants=openvswitch-switch.service
+
+  [Service]
+  Type=oneshot
+  RemainAfterExit=yes
+  ExecStart=/usr/local/bin/sdnlab flows
+  ExecStop=/usr/local/bin/sdnlab down
+
+  [Install]
+  WantedBy=multi-user.target
+  SDNLAB_UNIT_END
+  systemctl daemon-reload
+  systemctl enable sdnlab >/dev/null 2>&1
+  home=/home/student
+  [ -d $home ] || home=/root
+  cat > $home/README.md <<'SDNLAB_README_END'
+  # Lab: software-defined networking
+
+  In an ordinary switch the rules for moving frames are built in. In a software-defined network
+  they are data: a table of flows in the switch, written by you or by a program called a
+  controller. You will use Open vSwitch, a real software switch, and Mininet, a tool that builds
+  a whole test network on one machine. Everything is virtual and stays on this machine.
+
+      h1 (port 1) --+
+      h2 (port 2) --+-- br0 (Open vSwitch, OpenFlow 1.3, no flows yet)
+      h3 (port 3) --+
+
+  | host | address     | MAC address       | its port on br0 |
+  |------|-------------|-------------------|-----------------|
+  | h1   | 10.0.0.1/24 | 00:00:00:00:00:01 | 1               |
+  | h2   | 10.0.0.2/24 | 00:00:00:00:00:02 | 2               |
+  | h3   | 10.0.0.3/24 | 00:00:00:00:00:03 | 3               |
+
+  Each host is a network namespace, so you can run a command inside one with
+  sudo ip netns exec h1 ping 10.0.0.2. Your work is two files, both loaded every time the lab
+  starts: /etc/sdnlab/flows.txt (part 2) and /etc/sdnlab/switch.py (part 3).
+
+  ## Part 1: Mininet (not marked)
+
+  1. sudo mn --mac --test pingall builds two hosts, a switch and a controller, pings every
+     pair and tears it down. Read what it says it builds. How many pings were dropped?
+  2. sudo mn --mac --topo single,3 gives a prompt. Try nodes, links, h1 ping -c 1 h3 and
+     sh ovs-ofctl dump-flows s1, which lists what the controller c0 told the switch to do. Type
+     exit to leave, then sudo mn -c to clear anything left behind.
+
+  sudo mn -c removes every Open vSwitch bridge, br0 included, and so can Mininet itself when you
+  leave it with Ctrl-C or it stops on an error. Its own controller needs port 6653, which part
+  3's controller also uses. So run Mininet first, and afterwards sudo sdnlab flows builds the
+  lab again.
+
+  ## Part 2: write the flow table by hand
+
+  br0 starts with an empty flow table, and an OpenFlow switch with no flows drops everything,
+  which an ordinary switch never does. Look: sudo sdnlab status, then a ping from h1 to h2.
+  Write flows in /etc/sdnlab/flows.txt, one per line, in the form ovs-ofctl add-flow takes
+  (ovs-ofctl --help and man ovs-ofctl; the flows are OpenFlow 1.3). Make these true:
+
+  - h1 and h2 reach each other, both ways. A ping starts with ARP, so a flow that only lets
+    the echo through is not enough.
+  - h3 is dropped by a flow that says so: a flow that matches h3's traffic with the action
+    drop. h3 must reach nobody and nobody may reach h3.
+  - No flow may use the action NORMAL, which turns br0 back into an ordinary switch.
+
+  sudo sdnlab flows rebuilds the lab and loads the file. sudo ovs-ofctl -O OpenFlow13 dump-flows br0
+  lists the flows with n_packets, how many packets each one matched. Flows you add by hand with
+  ovs-ofctl are lost when the lab is rebuilt: only the file is kept.
+
+  ## Part 3: a learning switch in a controller
+
+  /etc/sdnlab/switch.py is an OpenFlow 1.3 controller application for os-ken. It is given
+  with three TODO steps in packet_in. Run sudo sdnlab controller to start it with br0 (the log is
+  /var/log/sdnlab-controller.log; the eventlet warning in it is harmless). As given it floods
+  every packet, like a hub. Finish it so that it learns which port each MAC address is on,
+  sends to that port, and installs a flow so the next packets of the conversation are handled
+  in the switch and never reach the controller. The check looks for each learned flow written
+  exactly as priority=1,in_port=PORT,dl_src=SOURCE_MAC,dl_dst=DESTINATION_MAC with the action
+  output to the port you learned, so give those flows priority 1 and match on those three
+  fields. Then ping between all the hosts and read
+  dump-flows again. sudo sdnlab flows brings back the part 2 lab.
+
+  ## The tools
+
+  - sudo sdnlab status        the switch, the hosts and the flows
+  - sudo sdnlab flows         rebuild the lab and load flows.txt, with no controller
+  - sudo sdnlab controller    rebuild the lab and start switch.py as its controller
+  - sudo sdnlab reset         put both files back as they were given
+  - sudo sdnlab shell h1      a shell inside h1 (exit to leave)
+  - sudo ovs-vsctl show       the switch's ports and controller
+  - sudo ip netns exec h1 tcpdump -ni eth0     watch what a host sees
+
+  Your teacher's check loads the two files itself, then tests what the hosts can reach and
+  reads the flow table.
+  SDNLAB_README_END
+  chown student:student $home/README.md 2>/dev/null
+  echo "Read README.md in your home folder first." > /etc/motd
+  systemctl start sdnlab 2>/dev/null || sdnlab flows
+
+# Marks a handed-in VM, KAN-29: run as root on a copy of the saved disk after a fresh boot, so
+# it sees only what was saved. Its exit status is the result: 0 passes.
+check: |
+  OF="ovs-ofctl -O OpenFlow13"
+  fail() {
+    echo "NOT PASSED: $*"
+    echo "--- flows on br0"; $OF dump-flows br0 2>&1 | tail -n +2 | cut -c1-200 | head -20
+    exit 1
+  }
+  command -v sdnlab >/dev/null || fail "the sdnlab tool is missing"
+  reach() { ip netns exec $1 ping -c 2 -W 1 -q $2 >/dev/null 2>&1; }
+  flush() { for n in 1 2 3; do ip netns exec h$n ip neigh flush all; done; }
+  # A fresh boot loads flows.txt and nothing else: so does the check, and flows typed by hand are gone.
+  out=$(sdnlab flows 2>&1) || fail "flows.txt does not load: $(echo "$out" | tail -n 3 | tr '\n' ' ')"
+  for n in 1 2 3; do ip netns list | grep -qw h$n || fail "the lab is not up: no h$n"; done
+  [ "$(ovs-vsctl get-fail-mode br0)" = secure ] || fail "br0 is not in fail-mode secure"
+  [ -z "$(ovs-vsctl get-controller br0)" ] || fail "br0 has a controller: parts 2 and 3 are marked apart, and this one has none"
+  flush
+  # h3's neighbours are given to it, so its packets reach the switch whatever the flows say about ARP.
+  for pair in "h3 10.0.0.1 01" "h3 10.0.0.2 02" "h1 10.0.0.3 03" "h2 10.0.0.3 03"; do
+    set -- $pair
+    ip netns exec $1 ip neigh replace $2 lladdr 00:00:00:00:00:$3 dev eth0 nud permanent
+  done
+  # Part 2: flows written by hand, and no controller.
+  $OF dump-flows br0 | grep -qi 'actions=NORMAL' && fail "a flow uses NORMAL, which makes the switch learn by itself: the lab asks for your own flows"
+  reach h1 10.0.0.2 || fail "h1 cannot reach h2 with the flows in flows.txt (a ping needs ARP first, then the echo and its reply)"
+  reach h2 10.0.0.1 || fail "h2 cannot reach h1 with the flows in flows.txt"
+  reach h3 10.0.0.1 && fail "h3 can still reach h1: the flows must drop h3"
+  reach h3 10.0.0.2 && fail "h3 can still reach h2: the flows must drop h3"
+  reach h1 10.0.0.3 && fail "h1 can reach h3: the flows must drop h3"
+  reach h2 10.0.0.3 && fail "h2 can reach h3: the flows must drop h3"
+  drops=$($OF dump-flows br0 | grep 'actions=drop' | grep -E 'in_port=3|dl_src=00:00:00:00:00:03|nw_src=10\.0\.0\.3|arp_spa=10\.0\.0\.3')
+  [ -n "$drops" ] || fail "h3 is blocked only because no flow lets it through: write a flow that matches h3 and drops it"
+  echo "$drops" | grep -qv 'n_packets=0,' || fail "the flow that drops h3 never matched a packet from h3: it does not describe h3's traffic"
+  # Part 3: the learning switch, with the controller in switch.py.
+  out=$(sdnlab controller 2>&1) || fail "the controller did not start or connect: $(echo "$out" | tail -n 4 | tr '\n' ' ')"
+  # h2 gets a MAC address nobody has seen, so a table written in advance is no use.
+  mac2=$(printf '02:5d:%02x:%02x:00:02' $((RANDOM % 256)) $((RANDOM % 256)))
+  ip netns exec h2 ip link set eth0 address $mac2
+  flush
+  reach h1 10.0.0.2 || fail "with your controller h1 cannot reach h2"
+  reach h2 10.0.0.3 || fail "with your controller h2 cannot reach h3"
+  reach h3 10.0.0.1 || fail "with your controller h3 cannot reach h1"
+  flows=$($OF dump-flows br0)
+  echo "$flows" | grep -q 'priority=0 actions=CONTROLLER' || fail "the switch has no flow that sends unknown packets to the controller"
+  for t in "1 00:00:00:00:00:01 2 $mac2" "2 $mac2 1 00:00:00:00:00:01" "2 $mac2 3 00:00:00:00:00:03" "3 00:00:00:00:00:03 2 $mac2" "3 00:00:00:00:00:03 1 00:00:00:00:00:01" "1 00:00:00:00:00:01 3 00:00:00:00:00:03"; do
+    set -- $t
+    echo "$flows" | grep -q "priority=1,in_port=$1,dl_src=$2,dl_dst=$4 actions=output:$3\$" || fail "no learned flow for $2 to $4 out of port $3: the controller must learn each address and install a flow"
+  done
+  echo "$flows" | grep 'priority=[1-9]' | grep -qiE 'FLOOD|ALL' && fail "a flow the controller installed floods: it must send to the one port it learned"
+  echo "PASSED: flows written by hand let h1 and h2 talk and drop h3, and the controller learns every address and installs the flows"

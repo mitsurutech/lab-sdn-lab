@@ -1,0 +1,25 @@
+name: check
+on:
+  push:
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The lab is valid and inside the platform's limits
+        run: |
+          python3 - <<'PY'
+          import glob
+          import yaml
+          files = sorted(glob.glob('*.lab.yaml'))
+          assert len(files) == 1, files
+          for name in files:
+              d = yaml.safe_load(open(name))
+              for key in ('cpus', 'memory', 'disk', 'setup', 'check'):
+                  assert key in d, f'{name}: no {key}'
+              for key in ('setup', 'check'):
+                  size = len(d[key].encode())
+                  assert size <= 16384, f'{name}: {key} is {size} bytes, over 16 KB'
+              print(name, 'ok')
+          PY
